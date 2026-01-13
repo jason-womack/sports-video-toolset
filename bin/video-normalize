@@ -94,7 +94,6 @@ main() {
     local AUDIO_NORMALIZE=false
     local ENCODING_PRESET="medium"
     local CRF_VALUE="23"
-    local use_preset=false
     
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -140,7 +139,6 @@ main() {
                     exit 1
                 fi
                 apply_preset "$1" || exit 1
-                use_preset=true
                 shift
                 ;;
             --crf)
