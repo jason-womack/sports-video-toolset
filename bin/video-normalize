@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# video-normalize - Normalize video for consistent playback
+# Usage: video-normalize INPUT OUTPUT
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+
+# shellcheck source=../lib/video-utils.sh
+source "$LIB_DIR/video-utils.sh"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") INPUT OUTPUT [OPTIONS]
+
+Normalize video and audio for consistent playback across platforms.
+
+Arguments:
+    INPUT       Input video file
+    OUTPUT      Output video file
+
+Options:
+    -h, --help              Show this help message
+    -i, --info              Show input file information only
+    -f, --force             Overwrite output file if it exists
+    -r, --resolution RES    Target resolution (e.g., 1920x1080, 1280x720)
+    -a, --audio-norm        Normalize audio levels
+    --framerate FPS         Target framerate (e.g., 30, 60)
+    --preset PRESET         Encoding preset: fast, medium, slow (default: medium)
+    --crf CRF               CRF quality (18-28, default: 23, lower=better)
+
+Presets:
+    youtube-1080p       1920x1080, 30fps, optimized for YouTube
+    youtube-720p        1280x720, 30fps, optimized for YouTube
+    web-friendly        1280x720, 30fps, web-optimized settings
+
+Examples:
+    $(basename "$0") raw-footage.mp4 normalized.mp4
+    $(basename "$0") game.mp4 game-norm.mp4 -r 1920x1080 -a
+    $(basename "$0") game.mp4 youtube.mp4 --preset youtube-1080p
+    $(basename "$0") raw.mp4 web.mp4 -r 1280x720 --framerate 30 --crf 23
+
+Notes:
+    - Normalizes video to standard codecs (H.264 video, AAC audio)
+    - Audio normalization uses loudnorm filter (EBU R128)
+    - Maintains aspect ratio when scaling
+    - Output is compatible with most players and platforms
+EOF
+}
+
+apply_preset() {
+    local preset="$1"
+    
+    case "$preset" in
+        youtube-1080p)
+            TARGET_RESOLUTION="1920x1080"
+            TARGET_FRAMERATE="30"
+            ENCODING_PRESET="medium"
+            CRF_VALUE="21"
+            AUDIO_NORMALIZE=true
+            ;;
+        youtube-720p)
+            TARGET_RESOLUTION="1280x720"
+            TARGET_FRAMERATE="30"
+            ENCODING_PRESET="medium"
+            CRF_VALUE="23"
+            AUDIO_NORMALIZE=true
+            ;;
+        web-friendly)
+            TARGET_RESOLUTION="1280x720"
+            TARGET_FRAMERATE="30"
+            ENCODING_PRESET="fast"
+            CRF_VALUE="24"
+            AUDIO_NORMALIZE=false
+            ;;
+        *)
+            log_error "Unknown preset: $preset"
+            return 1
+            ;;
+    esac
+    
+    log_info "Applied preset: $preset"
+    return 0
+}
+
+main() {
+    local input=""
+    local output=""
+    local force=false
+    local info_only=false
+    local TARGET_RESOLUTION=""
+    local TARGET_FRAMERATE=""
+    local AUDIO_NORMALIZE=false
+    local ENCODING_PRESET="medium"
+    local CRF_VALUE="23"
+    local use_preset=false
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -i|--info)
+                info_only=true
+                shift
+                ;;
+            -f|--force)
+                force=true
+                shift
+                ;;
+            -r|--resolution)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "Missing resolution argument"
+                    exit 1
+                fi
+                TARGET_RESOLUTION="$1"
+                shift
+                ;;
+            -a|--audio-norm)
+                AUDIO_NORMALIZE=true
+                shift
+                ;;
+            --framerate)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "Missing framerate argument"
+                    exit 1
+                fi
+                TARGET_FRAMERATE="$1"
+                shift
+                ;;
+            --preset)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "Missing preset argument"
+                    exit 1
+                fi
+                apply_preset "$1" || exit 1
+                use_preset=true
+                shift
+                ;;
+            --crf)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "Missing CRF argument"
+                    exit 1
+                fi
+                CRF_VALUE="$1"
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                if [[ -z "$input" ]]; then
+                    input="$1"
+                elif [[ -z "$output" ]]; then
+                    output="$1"
+                else
+                    log_error "Too many arguments"
+                    usage
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Validate required arguments
+    if [[ -z "$input" ]]; then
+        log_error "Missing required argument: INPUT"
+        usage
+        exit 1
+    fi
+    
+    # Check dependencies
+    check_ffmpeg || exit 1
+    check_ffprobe || exit 1
+    
+    # Validate input file
+    validate_input_file "$input" || exit 1
+    
+    # Show info and exit if requested
+    if [[ "$info_only" == true ]]; then
+        show_video_info "$input"
+        exit 0
+    fi
+    
+    # Validate remaining arguments
+    if [[ -z "$output" ]]; then
+        log_error "Missing required argument: OUTPUT"
+        usage
+        exit 1
+    fi
+    
+    # Check if output file exists
+    if [[ -f "$output" ]] && [[ "$force" != true ]]; then
+        log_error "Output file already exists: $output"
+        log_info "Use -f or --force to overwrite"
+        exit 1
+    fi
+    
+    # Ensure output directory exists
+    ensure_output_dir "$output"
+    
+    # Build filter chain
+    local video_filters=()
+    
+    if [[ -n "$TARGET_RESOLUTION" ]]; then
+        video_filters+=("scale=${TARGET_RESOLUTION}:force_original_aspect_ratio=decrease")
+        video_filters+=("pad=${TARGET_RESOLUTION}:(ow-iw)/2:(oh-ih)/2")
+    fi
+    
+    local audio_filters=()
+    
+    if [[ "$AUDIO_NORMALIZE" == true ]]; then
+        audio_filters+=("loudnorm=I=-16:LRA=11:TP=-1.5")
+    fi
+    
+    # Build ffmpeg command
+    local ffmpeg_cmd=(
+        ffmpeg
+        -i "$input"
+    )
+    
+    if [[ ${#video_filters[@]} -gt 0 ]]; then
+        local filter_str
+        filter_str=$(IFS=,; echo "${video_filters[*]}")
+        ffmpeg_cmd+=(-filter:v "$filter_str")
+    fi
+    
+    if [[ ${#audio_filters[@]} -gt 0 ]]; then
+        local filter_str
+        filter_str=$(IFS=,; echo "${audio_filters[*]}")
+        ffmpeg_cmd+=(-filter:a "$filter_str")
+    fi
+    
+    ffmpeg_cmd+=(
+        -c:v libx264
+        -preset "$ENCODING_PRESET"
+        -crf "$CRF_VALUE"
+        -c:a aac
+        -b:a 192k
+    )
+    
+    if [[ -n "$TARGET_FRAMERATE" ]]; then
+        ffmpeg_cmd+=(-r "$TARGET_FRAMERATE")
+    fi
+    
+    ffmpeg_cmd+=(
+        -movflags +faststart
+    )
+    
+    if [[ "$force" == true ]]; then
+        ffmpeg_cmd+=(-y)
+    fi
+    
+    ffmpeg_cmd+=("$output")
+    
+    # Execute normalize operation
+    log_info "Normalizing video..."
+    log_info "Input:  $input"
+    log_info "Output: $output"
+    if [[ -n "$TARGET_RESOLUTION" ]]; then
+        log_info "Resolution: $TARGET_RESOLUTION"
+    fi
+    if [[ -n "$TARGET_FRAMERATE" ]]; then
+        log_info "Framerate: ${TARGET_FRAMERATE}fps"
+    fi
+    log_info "Quality: CRF $CRF_VALUE, preset $ENCODING_PRESET"
+    if [[ "$AUDIO_NORMALIZE" == true ]]; then
+        log_info "Audio: Normalizing with loudnorm"
+    fi
+    
+    if "${ffmpeg_cmd[@]}"; then
+        verify_output "$output"
+    else
+        log_error "Failed to normalize video"
+        exit 1
+    fi
+}
+
+main "$@"

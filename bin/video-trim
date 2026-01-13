@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# video-trim - Losslessly trim video segments using stream copy
+# Usage: video-trim INPUT OUTPUT START [DURATION]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+
+# shellcheck source=../lib/video-utils.sh
+source "$LIB_DIR/video-utils.sh"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") INPUT OUTPUT START [DURATION]
+
+Losslessly trim a video file to extract a segment.
+
+Arguments:
+    INPUT       Input video file
+    OUTPUT      Output video file
+    START       Start time (format: HH:MM:SS or seconds)
+    DURATION    Duration to extract (optional, format: HH:MM:SS or seconds)
+                If omitted, extracts from START to end of file
+
+Options:
+    -h, --help      Show this help message
+    -i, --info      Show input file information only
+    -f, --force     Overwrite output file if it exists
+
+Examples:
+    $(basename "$0") game.mp4 highlight.mp4 00:15:30 00:02:00
+    $(basename "$0") game.mp4 highlight.mp4 930 120
+    $(basename "$0") game.mp4 second-half.mp4 00:45:00
+
+Notes:
+    - Uses stream copy for lossless, fast extraction
+    - Output may start slightly before requested time (keyframe boundary)
+    - For frame-accurate cuts, re-encode is required (use -c:v libx264)
+EOF
+}
+
+main() {
+    local input=""
+    local output=""
+    local start=""
+    local duration=""
+    local force=false
+    local info_only=false
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -i|--info)
+                info_only=true
+                shift
+                ;;
+            -f|--force)
+                force=true
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                if [[ -z "$input" ]]; then
+                    input="$1"
+                elif [[ -z "$output" ]]; then
+                    output="$1"
+                elif [[ -z "$start" ]]; then
+                    start="$1"
+                elif [[ -z "$duration" ]]; then
+                    duration="$1"
+                else
+                    log_error "Too many arguments"
+                    usage
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Validate required arguments
+    if [[ -z "$input" ]]; then
+        log_error "Missing required argument: INPUT"
+        usage
+        exit 1
+    fi
+    
+    # Check dependencies
+    check_ffmpeg || exit 1
+    check_ffprobe || exit 1
+    
+    # Validate input file
+    validate_input_file "$input" || exit 1
+    
+    # Show info and exit if requested
+    if [[ "$info_only" == true ]]; then
+        show_video_info "$input"
+        exit 0
+    fi
+    
+    # Validate remaining arguments
+    if [[ -z "$output" ]]; then
+        log_error "Missing required argument: OUTPUT"
+        usage
+        exit 1
+    fi
+    
+    if [[ -z "$start" ]]; then
+        log_error "Missing required argument: START"
+        usage
+        exit 1
+    fi
+    
+    # Check if output file exists
+    if [[ -f "$output" ]] && [[ "$force" != true ]]; then
+        log_error "Output file already exists: $output"
+        log_info "Use -f or --force to overwrite"
+        exit 1
+    fi
+    
+    # Ensure output directory exists
+    ensure_output_dir "$output"
+    
+    # Build ffmpeg command
+    local ffmpeg_cmd=(
+        ffmpeg
+        -ss "$start"
+        -i "$input"
+    )
+    
+    if [[ -n "$duration" ]]; then
+        ffmpeg_cmd+=(-t "$duration")
+    fi
+    
+    ffmpeg_cmd+=(
+        -c copy
+        -avoid_negative_ts make_zero
+    )
+    
+    if [[ "$force" == true ]]; then
+        ffmpeg_cmd+=(-y)
+    fi
+    
+    ffmpeg_cmd+=("$output")
+    
+    # Execute trim operation
+    log_info "Trimming video..."
+    log_info "Input:    $input"
+    log_info "Output:   $output"
+    log_info "Start:    $start"
+    if [[ -n "$duration" ]]; then
+        log_info "Duration: $duration"
+    else
+        log_info "Duration: to end of file"
+    fi
+    
+    if "${ffmpeg_cmd[@]}"; then
+        verify_output "$output"
+    else
+        log_error "Failed to trim video"
+        exit 1
+    fi
+}
+
+main "$@"
