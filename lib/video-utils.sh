@@ -202,6 +202,8 @@ verify_output() {
         return 1
     fi
     
+    # Get file size with cross-platform compatibility
+    # BSD (macOS) uses -f%z, GNU (Linux) uses -c%s
     local file_size
     file_size=$(stat -f%z "$output_file" 2>/dev/null || stat -c%s "$output_file" 2>/dev/null || echo "0")
     
@@ -210,6 +212,8 @@ verify_output() {
         return 1
     fi
     
+    # Format file size with fallback if numfmt not available
+    # numfmt is part of GNU coreutils, may not be on all systems
     log_success "Output file created: $output_file ($(numfmt --to=iec-i --suffix=B "$file_size" 2>/dev/null || echo "${file_size} bytes"))"
     return 0
 }

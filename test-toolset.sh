@@ -91,13 +91,15 @@ test_info "Test 6: Running shellcheck..."
 if command -v shellcheck >/dev/null 2>&1; then
     SHELLCHECK_ERRORS=0
     for script in video-trim video-combine video-crop video-normalize video-prepare video-info; do
-        if shellcheck "$BIN_DIR/$script" 2>&1 | grep -v "SC1091" | grep -q "warning\|error"; then
+        # Check shellcheck exit code; 0 = no issues, 1 = warnings/errors
+        # Exclude SC1091 (info about not following sourced files)
+        if ! shellcheck -e SC1091 "$BIN_DIR/$script" >/dev/null 2>&1; then
             test_fail "$script has shellcheck warnings/errors"
             ((SHELLCHECK_ERRORS++))
         fi
     done
     
-    if shellcheck "$SCRIPT_DIR/lib/video-utils.sh" 2>&1 | grep -q "warning\|error"; then
+    if ! shellcheck -e SC1091 "$SCRIPT_DIR/lib/video-utils.sh" >/dev/null 2>&1; then
         test_fail "video-utils.sh has shellcheck warnings/errors"
         ((SHELLCHECK_ERRORS++))
     fi
