@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# video-crop - Crop video to specific dimensions
+# Usage: video-crop INPUT OUTPUT WIDTH HEIGHT X Y
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+
+# shellcheck source=../lib/video-utils.sh
+source "$LIB_DIR/video-utils.sh"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") INPUT OUTPUT WIDTH HEIGHT X Y
+   or: $(basename "$0") INPUT OUTPUT --preset PRESET
+
+Crop video to specific dimensions.
+
+Arguments:
+    INPUT       Input video file
+    OUTPUT      Output video file
+    WIDTH       Width of cropped area (in pixels)
+    HEIGHT      Height of cropped area (in pixels)
+    X           X coordinate of top-left corner (in pixels)
+    Y           Y coordinate of top-left corner (in pixels)
+
+Options:
+    -h, --help              Show this help message
+    -i, --info              Show input file information only
+    -f, --force             Overwrite output file if it exists
+    -c, --copy              Attempt stream copy (experimental, may not work)
+    --preset PRESET         Use predefined crop preset
+
+Presets:
+    center-16:9     Crop center portion to 16:9 aspect ratio
+    center-4:3      Crop center portion to 4:3 aspect ratio
+    center-1:1      Crop center square
+    left-half       Crop left half of video
+    right-half      Crop right half of video
+
+Examples:
+    $(basename "$0") game.mp4 cropped.mp4 1280 720 320 180
+    $(basename "$0") game.mp4 square.mp4 --preset center-1:1
+    $(basename "$0") game.mp4 main-camera.mp4 --preset left-half
+
+Notes:
+    - Cropping requires re-encoding (no lossless crop with ffmpeg)
+    - Uses libx264 for H.264 encoding with high quality preset
+    - Original audio is copied without re-encoding
+    - Coordinates (X,Y) are relative to top-left corner
+EOF
+}
+
+calculate_preset_crop() {
+    local input="$1"
+    local preset="$2"
+    
+    local resolution
+    resolution=$(get_resolution "$input")
+    local input_width="${resolution%x*}"
+    local input_height="${resolution#*x}"
+    
+    local crop_w crop_h crop_x crop_y
+    
+    case "$preset" in
+        center-16:9)
+            # Crop to 16:9 from center
+            if (( input_width * 9 > input_height * 16 )); then
+                # Width is limiting factor
+                crop_h=$input_height
+                crop_w=$((input_height * 16 / 9))
+            else
+                # Height is limiting factor
+                crop_w=$input_width
+                crop_h=$((input_width * 9 / 16))
+            fi
+            crop_x=$(((input_width - crop_w) / 2))
+            crop_y=$(((input_height - crop_h) / 2))
+            ;;
+        center-4:3)
+            # Crop to 4:3 from center
+            if (( input_width * 3 > input_height * 4 )); then
+                crop_h=$input_height
+                crop_w=$((input_height * 4 / 3))
+            else
+                crop_w=$input_width
+                crop_h=$((input_width * 3 / 4))
+            fi
+            crop_x=$(((input_width - crop_w) / 2))
+            crop_y=$(((input_height - crop_h) / 2))
+            ;;
+        center-1:1)
+            # Crop to square from center
+            if (( input_width > input_height )); then
+                crop_w=$input_height
+                crop_h=$input_height
+            else
+                crop_w=$input_width
+                crop_h=$input_width
+            fi
+            crop_x=$(((input_width - crop_w) / 2))
+            crop_y=$(((input_height - crop_h) / 2))
+            ;;
+        left-half)
+            crop_w=$((input_width / 2))
+            crop_h=$input_height
+            crop_x=0
+            crop_y=0
+            ;;
+        right-half)
+            crop_w=$((input_width / 2))
+            crop_h=$input_height
+            crop_x=$((input_width / 2))
+            crop_y=0
+            ;;
+        *)
+            log_error "Unknown preset: $preset"
+            return 1
+            ;;
+    esac
+    
+    echo "$crop_w:$crop_h:$crop_x:$crop_y"
+}
+
+main() {
+    local input=""
+    local output=""
+    local width=""
+    local height=""
+    local x=""
+    local y=""
+    local force=false
+    local info_only=false
+    local use_copy=false
+    local use_preset=false
+    local preset=""
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -i|--info)
+                info_only=true
+                shift
+                ;;
+            -f|--force)
+                force=true
+                shift
+                ;;
+            -c|--copy)
+                use_copy=true
+                shift
+                ;;
+            --preset)
+                use_preset=true
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "Missing preset argument"
+                    exit 1
+                fi
+                preset="$1"
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                if [[ -z "$input" ]]; then
+                    input="$1"
+                elif [[ -z "$output" ]]; then
+                    output="$1"
+                elif [[ -z "$width" ]]; then
+                    width="$1"
+                elif [[ -z "$height" ]]; then
+                    height="$1"
+                elif [[ -z "$x" ]]; then
+                    x="$1"
+                elif [[ -z "$y" ]]; then
+                    y="$1"
+                else
+                    log_error "Too many arguments"
+                    usage
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Validate required arguments
+    if [[ -z "$input" ]]; then
+        log_error "Missing required argument: INPUT"
+        usage
+        exit 1
+    fi
+    
+    # Check dependencies
+    check_ffmpeg || exit 1
+    check_ffprobe || exit 1
+    
+    # Validate input file
+    validate_input_file "$input" || exit 1
+    
+    # Show info and exit if requested
+    if [[ "$info_only" == true ]]; then
+        show_video_info "$input"
+        exit 0
+    fi
+    
+    # Validate remaining arguments
+    if [[ -z "$output" ]]; then
+        log_error "Missing required argument: OUTPUT"
+        usage
+        exit 1
+    fi
+    
+    # Calculate crop parameters
+    local crop_filter=""
+    if [[ "$use_preset" == true ]]; then
+        crop_filter=$(calculate_preset_crop "$input" "$preset") || exit 1
+        log_info "Using preset: $preset"
+        log_info "Crop filter: crop=$crop_filter"
+    else
+        if [[ -z "$width" || -z "$height" || -z "$x" || -z "$y" ]]; then
+            log_error "Missing crop parameters: WIDTH HEIGHT X Y"
+            usage
+            exit 1
+        fi
+        crop_filter="${width}:${height}:${x}:${y}"
+    fi
+    
+    # Check if output file exists
+    if [[ -f "$output" ]] && [[ "$force" != true ]]; then
+        log_error "Output file already exists: $output"
+        log_info "Use -f or --force to overwrite"
+        exit 1
+    fi
+    
+    # Ensure output directory exists
+    ensure_output_dir "$output"
+    
+    # Build ffmpeg command
+    local ffmpeg_cmd=(
+        ffmpeg
+        -i "$input"
+        -filter:v "crop=${crop_filter}"
+    )
+    
+    if [[ "$use_copy" == true ]]; then
+        ffmpeg_cmd+=(-c:v copy)
+        log_warn "Stream copy with crop filter is experimental"
+    else
+        ffmpeg_cmd+=(
+            -c:v libx264
+            -preset medium
+            -crf 18
+        )
+    fi
+    
+    ffmpeg_cmd+=(
+        -c:a copy
+    )
+    
+    if [[ "$force" == true ]]; then
+        ffmpeg_cmd+=(-y)
+    fi
+    
+    ffmpeg_cmd+=("$output")
+    
+    # Execute crop operation
+    log_info "Cropping video..."
+    log_info "Input:  $input"
+    log_info "Output: $output"
+    log_info "Crop:   $crop_filter"
+    
+    if "${ffmpeg_cmd[@]}"; then
+        verify_output "$output"
+    else
+        log_error "Failed to crop video"
+        exit 1
+    fi
+}
+
+main "$@"
