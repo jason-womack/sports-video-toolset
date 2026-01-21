@@ -1,51 +1,30 @@
 #!/usr/bin/env bash
-set -euox pipefail
+set -euo pipefail
 shopt -s nullglob
 
 # === DEFAULTS ===
-SKIP_NORMALIZATION=false
 INPUT_DIR="."
-PREVIEW=false
-PREVIEW_DURATION=10
 FILTER_AUDIO=false
 DEBUG=false
-DRY_RUN=false
+
+log()   { echo "[INFO] $*"; }
+debug() { [ "$DEBUG" = true ] && echo "[DEBUG] $*" >&2; }
 
 # === FLAG PARSING ===
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --skip-normalization)
-      SKIP_NORMALIZATION=true
-      shift
-      ;;
-    --preview)
-      PREVIEW=true
-      PREVIEW_DURATION="${2:-10}"
-      shift 2
-      ;;
-    --filter-audio)
-      FILTER_AUDIO=true
-      shift
-      ;;
-    --debug|-d|--verbose|-v)
-      DEBUG=true
-      shift
-      ;;
-    --dry-run)
-      DRY_RUN=true
-      shift
-      ;;
-    *)
-      INPUT_DIR="$1"
-      shift
-      ;;
+    --filter-audio) FILTER_AUDIO=true; shift ;;
+    --debug|-d) DEBUG=true; shift ;;
+    *) INPUT_DIR="$1"; shift ;;
   esac
 done
 
-log()   { echo "[INFO] $*"; }
-debug() { $DEBUG && echo "[DEBUG] $*" >&2; }
+# Enable full shell tracing when -d is used
+if [[ "$DEBUG" = true ]]; then
+  set -x
+fi
 
-# === NORMALIZE FILES INTO PREFIX FOLDERS ===
+# === NORMALIZATION ===
 normalize_files() {
   log "Detecting normalization..."
 
@@ -55,119 +34,78 @@ normalize_files() {
       "$INPUT_DIR"/DJI_*.[Mm][Oo][Vv] \
       "$INPUT_DIR"/VID_*.[Mm][Pp]4 \
       "$INPUT_DIR"/VID_*.[Mm][Oo][Vv]; do
-
     for f in $pattern; do
       [[ -f "$f" ]] && RAW_FILES+=("$f")
     done
   done
 
-  NORMALIZED_FOLDERS=()
-  for pattern in "$INPUT_DIR"/DJI_* "$INPUT_DIR"/VID_*; do
-    for d in $pattern; do
-      [[ -d "$d" ]] && NORMALIZED_FOLDERS+=("$d")
-    done
+  if (( ${#RAW_FILES[@]} == 0 )); then
+    debug "No DJI/VID files found for normalization"
+    return
+  fi
+
+  prefixes=()
+  for f in "${RAW_FILES[@]}"; do
+    base=$(basename "$f")
+    if [[ "$base" == DJI_* ]]; then
+      p=$(echo "$base" | cut -d_ -f1-2)
+    else
+      p=$(echo "$base" | cut -d_ -f1-3)
+    fi
+    prefixes+=("$p")
   done
 
-  HAS_RAW=false
-  HAS_FOLDERS=false
-  (( ${#RAW_FILES[@]} > 0 )) && HAS_RAW=true
-  (( ${#NORMALIZED_FOLDERS[@]} > 0 )) && HAS_FOLDERS=true
+  unique=($(printf "%s\n" "${prefixes[@]}" | sort -u))
+  if (( ${#unique[@]} == 1 )); then
+    log "All files share prefix '${unique[0]}'. Treating current directory as normalized."
+    return
+  fi
 
-  # === NEW RULE: If all RAW files share the same prefix → treat current folder as normalized
-  if [[ "$HAS_RAW" == true ]]; then
-    prefixes=()
-
-    for f in "${RAW_FILES[@]}"; do
-      base=$(basename "$f")
-
-      if [[ "$base" == DJI_* ]]; then
-        p=$(echo "$base" | cut -d_ -f1-2)
-      elif [[ "$base" == VID_* ]]; then
-        p=$(echo "$base" | cut -d_ -f1-3)
-      else
-        p=$(echo "$base" | cut -d_ -f1-2)
-      fi
-
-      prefixes+=("$p")
-    done
-
-    unique_prefixes=($(printf "%s\n" "${prefixes[@]}" | sort -u))
-
-    if (( ${#unique_prefixes[@]} == 1 )); then
-      log "All files share prefix '${unique_prefixes[0]}'. Treating current directory as normalized."
-      return
+  log "Normalizing raw files..."
+  for f in "${RAW_FILES[@]}"; do
+    base=$(basename "$f")
+    if [[ "$base" == DJI_* ]]; then
+      prefix=$(echo "$base" | cut -d_ -f1-2)
+    else
+      prefix=$(echo "$base" | cut -d_ -f1-3)
     fi
-  fi
-
-  # === CASE 1: Raw files exist → normalize
-  if [[ "$HAS_RAW" == true ]]; then
-    log "Raw DJI/VID files detected. Normalizing..."
-
-    for f in "${RAW_FILES[@]}"; do
-      base=$(basename "$f")
-
-      if [[ "$base" == DJI_* ]]; then
-        prefix=$(echo "$base" | cut -d_ -f1-2)
-      elif [[ "$base" == VID_* ]]; then
-        prefix=$(echo "$base" | cut -d_ -f1-3)
-      else
-        prefix=$(echo "$base" | cut -d_ -f1-2)
-      fi
-
-      target="$INPUT_DIR/$prefix"
-      mkdir -p "$target"
-
-      mv "$f" "$target/$base"
-      debug "Moved $base → $target/"
-    done
-
-    return
-  fi
-
-  # === CASE 2: Already normalized
-  if [[ "$HAS_FOLDERS" == true ]]; then
-    debug "Skipping normalization (already normalized)"
-    return
-  fi
-
-  debug "No DJI/VID files found for normalization"
+    mkdir -p "$INPUT_DIR/$prefix"
+    mv "$f" "$INPUT_DIR/$prefix/$base"
+  done
 }
 
-# === PROCESS EACH PREFIX FOLDER ===
+# === PROCESS FOLDER ===
 process_folder() {
   folder="$1"
+  log "process_folder called for: $folder"
   cd "$folder"
-  log "Processing folder: $folder"
-
-  ls DJI_*.[Mm][Pp]4 DJI_*.[Mm][Oo][Vv] VID_*.[Mm][Pp]4 VID_*.[Mm][Oo][Vv] 2>/dev/null | sort > input.txt
-  [[ -s input.txt ]] || { log "No input files in $folder, skipping."; cd - >/dev/null; return; }
 
   prefix=$(basename "$(pwd)")
-  preview_out="${prefix}_preview.mp4"
-  final_out="${prefix}_final.mp4"
+  combined="${prefix}_combined.mp4"
+  preview="${prefix}_preview.mp4"
+  final="${prefix}_final.mp4"
   cfg="${prefix}.cfg"
 
-  # === CREATE DEFAULT CONFIG IF MISSING ===
+  # Create cfg if missing
   if [[ ! -f "$cfg" ]]; then
     cat > "$cfg" <<EOF
 left-crop=0.0
-bottom-crop=0.0
 right-crop=0.0
+bottom-crop=0.0
 start-trim=0.0
 end-trim=0.0
 preview=true
+preview-length=10
 EOF
     log "Created default config: $cfg"
   fi
 
-  # === ALWAYS PAUSE HERE ===
   echo
-  echo "[INFO] Config ready for $folder: $cfg"
-  echo "[INFO] Edit start-trim and end-trim values now."
+  echo "[INFO] Edit config: $cfg"
   ${EDITOR:-nano} "$cfg"
-  read -r -p "Press ENTER when ready to render..." _
+  read -r -p "Press ENTER to continue..." _
 
-  # === PARSE CONFIG ===
+  # Parse cfg
   declare -A CFG
   while IFS='=' read -r key value; do
     key=$(echo "$key" | tr -d '[:space:]')
@@ -175,94 +113,114 @@ EOF
     CFG["$key"]="$value"
   done < "$cfg"
 
-  left_crop="${CFG[left-crop]:-0.0}"
-  bottom_crop="${CFG[bottom-crop]:-0.0}"
-  right_crop="${CFG[right-crop]:-0.0}"
-  start_trim="${CFG[start-trim]:-0.0}"
-  end_trim="${CFG[end-trim]:-0.0}"
-  cfg_preview="${CFG[preview]:-false}"
+  left="${CFG[left-crop]:-0}"
+  right="${CFG[right-crop]:-0}"
+  bottom="${CFG[bottom-crop]:-0}"
+  start="${CFG[start-trim]:-0}"
+  end="${CFG[end-trim]:-0}"
+  do_preview="${CFG[preview]:-true}"
+  preview_len="${CFG[preview-length]:-10}"
 
-  # === DETERMINE ZERO-REENCODE PATH ===
-  no_crop=false
-  if [[ "$left_crop" == 0* && "$right_crop" == 0* && "$bottom_crop" == 0* ]]; then
-      no_crop=true
+  debug "Config: left=$left right=$right bottom=$bottom start=$start end=$end preview=$do_preview preview_len=$preview_len"
+
+  # Determine if cropping is needed
+  no_crop=true
+  if (( $(echo "$left > 0" | bc -l) )) || \
+     (( $(echo "$right > 0" | bc -l) )) || \
+     (( $(echo "$bottom > 0" | bc -l) )); then
+    no_crop=false
   fi
+  debug "no_crop=$no_crop"
 
-  # === GET PER-FILE DURATIONS ===
-  mapfile -t FILES < input.txt
-  declare -A DUR
-  for f in "${FILES[@]}"; do
-    DUR["$f"]=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f")
-  done
+  # Detect source clips
+  printf "%s\n" DJI_*.[Mm][Pp]4 DJI_*.[Mm][Oo][Vv] VID_*.[Mm][Pp]4 VID_*.[Mm][Oo][Vv] \
+    | grep -v '\*' | sort > input.txt
 
-  # === BUILD concat_trimmed.txt WHEN no_crop=true ===
-  if [[ "$no_crop" == true ]]; then
-    log "Building concat_trimmed.txt for zero-reencode concat+trim..."
+  has_sources=false
+  [[ -s input.txt ]] && has_sources=true
 
-    total=0
-    remaining_start="$start_trim"
-    remaining_end="$end_trim"
+  # === FAST PATH (no crop, has sources, no combined) ===
+  if [[ "$no_crop" == true && "$has_sources" == true && ! -f "$combined" ]]; then
+    log "Fast path: no crop → generating final directly without combined"
 
-    > concat_trimmed.txt
+    > concat.txt
+    total_duration=0
 
-    # Pass 1: handle start_trim
-    for f in "${FILES[@]}"; do
-      dur=${DUR["$f"]}
+    while read -r f; do
+      echo "file '$PWD/$f'" >> concat.txt
 
-      if (( $(echo "$remaining_start >= $dur" | bc -l) )); then
-        remaining_start=$(echo "$remaining_start - $dur" | bc -l)
-        continue
-      fi
+      # Get duration of each file individually
+      d=$(ffprobe -v error -select_streams v:0 \
+          -show_entries format=duration \
+          -of csv=p=0 "$f")
 
-      echo "file '$PWD/$f'" >> concat_trimmed.txt
-      echo "inpoint $remaining_start" >> concat_trimmed.txt
-      break
-    done
+      # If ffprobe fails, treat as zero instead of N/A
+      [[ "$d" == "N/A" || -z "$d" ]] && d=0
 
-    # Pass 2: middle files
-    start_found=false
-    for f in "${FILES[@]}"; do
-      if [[ "$start_found" == false ]]; then
-        [[ "$f" == "${FILES[0]}" ]] && start_found=true
-        continue
-      fi
-      echo "file '$PWD/$f'" >> concat_trimmed.txt
-    done
+      total_duration=$(awk "BEGIN {print $total_duration + $d}")
+    done < input.txt
 
-    # Pass 3: apply end_trim to last file
-    last="${FILES[-1]}"
-    last_dur=${DUR["$last"]}
-    outpoint=$(echo "$last_dur - $end_trim" | bc -l)
-    echo "outpoint $outpoint" >> concat_trimmed.txt
+    trim_duration=$(awk "BEGIN {print $total_duration - $start - $end}")
+    (( $(echo "$trim_duration < 0" | bc -l) )) && trim_duration=0
 
-    # === SINGLE-PASS CONCAT+TRIM ===
-    log "Running zero-reencode concat+trim → $final_out"
-    ffmpeg -y -f concat -safe 0 -i concat_trimmed.txt -c copy "$final_out"
+    # Generate final
+    ffmpeg -y -ss "$start" -f concat -safe 0 -i concat.txt \
+      -t "$trim_duration" -c copy -movflags +faststart "$final"
+
+    # Generate preview from final
+    if [[ "${do_preview,,}" == "true" ]]; then
+      log "Generating preview from final → $preview"
+      ffmpeg -y -ss 0 -i "$final" \
+        -t "$preview_len" \
+        -c:v h264_videotoolbox -b:v 60000000 \
+        "$preview"
+    fi
+
     cd - >/dev/null
     return
   fi
 
-  # === NON-ZERO-CROP PATH (existing behavior) ===
-  # Combine first
-  out="${prefix}_combined.mp4"
-  if [[ ! -f "$out" ]]; then
-    log "Combining files (reencode) → $out"
-    cmd=(ffmpeg -y -f concat -safe 0 -analyzeduration 100000000 -probesize 100000000 \
-          -i <(sed "s|^|file '$PWD/|" input.txt | sed "s|$|'|") \
-          -map 0:v:0 -map 0:a:0 -c:v h264_videotoolbox -b:v 60000000)
-    $FILTER_AUDIO && cmd+=(-af "highpass=f=200,lowpass=f=3000")
-    cmd+=("$out")
-    "${cmd[@]}"
+
+  # === COMBINED EXISTS ===
+  if [[ -f "$combined" ]]; then
+    log "Using existing combined file: $combined"
+  else
+    # === NEED TO CREATE COMBINED ===
+    if [[ "$has_sources" == false ]]; then
+      log "No combined file and no source clips. Nothing to do."
+      cd - >/dev/null
+      return
+    fi
+
+    log "Combining source clips → $combined"
+
+    > concat.txt
+    while read -r f; do
+      echo "file '$PWD/$f'" >> concat.txt
+    done < input.txt
+
+    if [[ "$no_crop" == true ]]; then
+      ffmpeg -y -f concat -safe 0 -i concat.txt -c copy "$combined"
+    else
+      cmd=(ffmpeg -y -f concat -safe 0 -i concat.txt -map 0:v:0 -map 0:a:0 \
+            -c:v h264_videotoolbox -b:v 60000000)
+      $FILTER_AUDIO && cmd+=(-af "highpass=f=200,lowpass=f=3000")
+      cmd+=("$combined")
+      "${cmd[@]}"
+    fi
   fi
 
-  # Get dimensions
-  width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$out")
-  height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$out")
-  duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out")
+  # Get video info
+  width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$combined")
+  height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$combined")
+  duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$combined")
 
-  crop_left_px=$(awk "BEGIN {print int($width * $left_crop / 2)}")
-  crop_right_px=$(awk "BEGIN {print int($width * $right_crop / 2)}")
-  crop_bottom_px=$(awk "BEGIN {print int($height * $bottom_crop / 2)}")
+  debug "Video: ${width}x${height}, duration=$duration"
+
+  # Crop math
+  crop_left_px=$(awk "BEGIN {print int($width * $left / 2)}")
+  crop_right_px=$(awk "BEGIN {print int($width * $right / 2)}")
+  crop_bottom_px=$(awk "BEGIN {print int($height * $bottom / 2)}")
 
   remaining_width=$((width - crop_left_px - crop_right_px))
   ideal_height=$(awk "BEGIN {print int($remaining_width / 1.77777777778)}")
@@ -272,39 +230,40 @@ EOF
   crop_w=$((width - crop_left_px - crop_right_px))
   crop_h=$((height - crop_top_px - crop_bottom_px))
 
-  trim_duration=$(awk "BEGIN {print $duration - $start_trim - $end_trim}")
+  debug "Crop px: left=$crop_left_px right=$crop_right_px top=$crop_top_px bottom=$crop_bottom_px w=$crop_w h=$crop_h"
 
-  log "Final render path (crop/zoom) → $final_out"
-  ffmpeg -y -ss "$start_trim" -i "$out" \
-    -vf "crop=w=$crop_w:h=$crop_h:x=$crop_left_px:y=$crop_top_px,
-         scale=3840:2160:flags=lanczos,
-         unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.5,
-         hqdn3d=10" \
-    -t "$trim_duration" \
-    -c:v h264_videotoolbox -b:v 60000000 \
-    -movflags +faststart \
-    -c:a aac -b:a 384k -ar 48000 \
-    "$final_out"
+  # Preview or final
+  if [[ "${do_preview,,}" == "true" ]]; then
+    log "Generating preview → $preview"
+    ffmpeg -y -ss "$start" -i "$combined" \
+      -vf "crop=w=$crop_w:h=$crop_h:x=$crop_left_px:y=$crop_top_px" \
+      -t "$preview_len" -c:v h264_videotoolbox -b:v 60000000 "$preview"
+  else
+    trim_duration=$(awk "BEGIN {print $duration - $start - $end}")
+    log "Generating final → $final (trim_duration=$trim_duration)"
+
+    if [[ "$no_crop" == true ]]; then
+      ffmpeg -y -ss "$start" -i "$combined" \
+        -t "$trim_duration" -c copy -movflags +faststart "$final"
+      rm -f "$combined"
+    else
+      ffmpeg -y -ss "$start" -i "$combined" \
+        -vf "crop=w=$crop_w:h=$crop_h:x=$crop_left_px:y=$crop_top_px,
+             scale=3840:2160:flags=lanczos,
+             unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.5,
+             hqdn3d=10" \
+        -t "$trim_duration" \
+        -c:v h264_videotoolbox -b:v 60000000 \
+        -movflags +faststart \
+        -c:a aac -b:a 384k -ar 48000 \
+        "$final"
+    fi
+  fi
 
   cd - >/dev/null
 }
 
 # === MAIN ===
 normalize_files
-
-log "Processing folders..."
-FILES=("$INPUT_DIR"/DJI_*.[Mm][Pp]4 "$INPUT_DIR"/DJI_*.[Mm][Oo][Vv] "$INPUT_DIR"/VID_*.[Mm][Pp]4 "$INPUT_DIR"/VID_*.[Mm][Oo][Vv])
-
-if (( ${#FILES[@]} > 0 )); then
-  echo "[INFO] Single normalized folder detected: $INPUT_DIR"
-  process_folder "$INPUT_DIR"
-else
-  echo "[INFO] Batch mode: processing all DJI_/VID_ subfolders"
-  for dir in "$INPUT_DIR"/DJI_* "$INPUT_DIR"/VID_*; do
-    [[ -d "$dir" ]] || continue
-    process_folder "$dir" &
-  done
-fi
-
-wait
-echo "All rendering jobs completed."
+process_folder "$INPUT_DIR"
+echo "[INFO] All rendering jobs completed."
