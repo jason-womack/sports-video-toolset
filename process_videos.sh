@@ -4,7 +4,6 @@ shopt -s nullglob
 
 # === DEFAULTS ===
 INPUT_DIR="."
-FILTER_AUDIO=false
 DEBUG=false
 
 log()   { echo "[INFO] $*"; }
@@ -13,16 +12,12 @@ debug() { [ "$DEBUG" = true ] && echo "[DEBUG] $*" >&2; }
 # === FLAG PARSING ===
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --filter-audio) FILTER_AUDIO=true; shift ;;
     --debug|-d) DEBUG=true; shift ;;
     *) INPUT_DIR="$1"; shift ;;
   esac
 done
 
-# Enable full shell tracing when -d is used
-if [[ "$DEBUG" = true ]]; then
-  set -x
-fi
+[[ "$DEBUG" = true ]] && set -x
 
 # === NORMALIZATION ===
 normalize_files() {
@@ -77,7 +72,7 @@ normalize_files() {
 # === PROCESS FOLDER ===
 process_folder() {
   folder="$1"
-  log "process_folder called for: $folder"
+  log "Processing folder: $folder"
   cd "$folder"
 
   prefix=$(basename "$(pwd)")
@@ -86,28 +81,37 @@ process_folder() {
   final="${prefix}_final.mp4"
   cfg="${prefix}.cfg"
 
-  # Create cfg if missing
+  # === CREATE CFG IF MISSING ===
   if [[ ! -f "$cfg" ]]; then
     cat > "$cfg" <<EOF
+# === FILTER SLOTS ===
 left-crop=0.0
 right-crop=0.0
 bottom-crop=0.0
 start-trim=0.0
 end-trim=0.0
+
 preview=true
 preview-length=10
+
+default-scale=scale=in_range=tv:out_range=tv,scale=3840:2160:flags=lanczos
+default-denoise=
+default-sharpen=
+
+additional-params=
 EOF
     log "Created default config: $cfg"
   fi
 
-  echo
   echo "[INFO] Edit config: $cfg"
   ${EDITOR:-nano} "$cfg"
   read -r -p "Press ENTER to continue..." _
 
-  # Parse cfg
+  # === PARSE CFG ===
   declare -A CFG
   while IFS='=' read -r key value; do
+    [[ -z "$key" ]] && continue
+    [[ "$key" =~ ^# ]] && continue
     key=$(echo "$key" | tr -d '[:space:]')
     value=$(echo "$value" | tr -d '[:space:]')
     CFG["$key"]="$value"
@@ -121,103 +125,76 @@ EOF
   do_preview="${CFG[preview]:-true}"
   preview_len="${CFG[preview-length]:-10}"
 
-  debug "Config: left=$left right=$right bottom=$bottom start=$start end=$end preview=$do_preview preview_len=$preview_len"
+  default_scale="${CFG[default-scale]}"
+  default_denoise="${CFG[default-denoise]}"
+  default_sharpen="${CFG[default-sharpen]}"
+  additional_params="${CFG[additional-params]:-}"
 
-  # Determine if cropping is needed
-  no_crop=true
-  if (( $(echo "$left > 0" | bc -l) )) || \
-     (( $(echo "$right > 0" | bc -l) )) || \
-     (( $(echo "$bottom > 0" | bc -l) )); then
-    no_crop=false
-  fi
-  debug "no_crop=$no_crop"
-
-  # Detect source clips
+  # === DETECT SOURCE CLIPS ===
   printf "%s\n" DJI_*.[Mm][Pp]4 DJI_*.[Mm][Oo][Vv] VID_*.[Mm][Pp]4 VID_*.[Mm][Oo][Vv] \
     | grep -v '\*' | sort > input.txt
 
   has_sources=false
   [[ -s input.txt ]] && has_sources=true
 
-  # === FAST PATH (no crop, has sources, no combined) ===
-  if [[ "$no_crop" == true && "$has_sources" == true && ! -f "$combined" ]]; then
-    log "Fast path: no crop → generating final directly without combined"
-
-    > concat.txt
-    total_duration=0
-
-    while read -r f; do
-      echo "file '$PWD/$f'" >> concat.txt
-
-      # Get duration of each file individually
-      d=$(ffprobe -v error -select_streams v:0 \
-          -show_entries format=duration \
-          -of csv=p=0 "$f")
-
-      # If ffprobe fails, treat as zero instead of N/A
-      [[ "$d" == "N/A" || -z "$d" ]] && d=0
-
-      total_duration=$(awk "BEGIN {print $total_duration + $d}")
-    done < input.txt
-
-    trim_duration=$(awk "BEGIN {print $total_duration - $start - $end}")
-    (( $(echo "$trim_duration < 0" | bc -l) )) && trim_duration=0
-
-    # Generate final
-    ffmpeg -y -ss "$start" -f concat -safe 0 -i concat.txt \
-      -t "$trim_duration" -c copy -movflags +faststart "$final"
-
-    # Generate preview from final
-    if [[ "${do_preview,,}" == "true" ]]; then
-      log "Generating preview from final → $preview"
-      ffmpeg -y -ss 0 -i "$final" \
-        -t "$preview_len" \
-        -c:v h264_videotoolbox -b:v 60000000 \
-        "$preview"
-    fi
-
-    cd - >/dev/null
-    return
-  fi
-
-
-  # === COMBINED EXISTS ===
+  # === COMBINE STEP (C1) ===
   if [[ -f "$combined" ]]; then
-    log "Using existing combined file: $combined"
+    log "Combined file exists → skipping combine (C1)"
   else
-    # === NEED TO CREATE COMBINED ===
     if [[ "$has_sources" == false ]]; then
-      log "No combined file and no source clips. Nothing to do."
+      log "No source clips found."
       cd - >/dev/null
       return
     fi
 
-    log "Combining source clips → $combined"
+    log "FAST COMBINE: HEVC/H.264 copy → $combined"
 
     > concat.txt
     while read -r f; do
       echo "file '$PWD/$f'" >> concat.txt
     done < input.txt
 
-    if [[ "$no_crop" == true ]]; then
-      ffmpeg -y -f concat -safe 0 -i concat.txt -c copy "$combined"
-    else
-      cmd=(ffmpeg -y -f concat -safe 0 -i concat.txt -map 0:v:0 -map 0:a:0 \
-            -c:v h264_videotoolbox -b:v 60000000)
-      $FILTER_AUDIO && cmd+=(-af "highpass=f=200,lowpass=f=3000")
-      cmd+=("$combined")
-      "${cmd[@]}"
-    fi
+    ffmpeg -y -f concat -safe 0 -i concat.txt \
+      -map 0:v -map "0:a?" \
+      -c copy \
+      "$combined"
   fi
 
-  # Get video info
+  # === DETECT SOURCE CODEC ===
+  codec=$(ffprobe -v error -select_streams v:0 \
+          -show_entries stream=codec_name \
+          -of csv=p=0 "$combined")
+
+  log "Detected source codec: $codec"
+
+  # === SELECT ENCODER BASED ON SOURCE ===
+  case "$codec" in
+    hevc)
+      ENCODER="libx265"
+      ENC_OPTS="-preset fast -crf 20 -tag:v hvc1 -x265-params bframes=0:colorprim=bt709:transfer=bt709:colormatrix=bt709:range=limited"
+      HEVC_DOWNSCALE=true
+      ;;
+    h264)
+      ENCODER="libx264"
+      ENC_OPTS="-preset veryfast -crf 18 -x264-params colorprim=bt709:transfer=bt709:colormatrix=bt709:range=limited"
+      HEVC_DOWNSCALE=false
+      ;;
+    *)
+      log "Unknown codec '$codec', falling back to libx264"
+      ENCODER="libx264"
+      ENC_OPTS="-preset veryfast -crf 18 -x264-params colorprim=bt709:transfer=bt709:colormatrix=bt709:range=limited"
+      HEVC_DOWNSCALE=false
+      ;;
+  esac
+
+  log "Using encoder: $ENCODER $ENC_OPTS"
+
+  # === VIDEO INFO ===
   width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$combined")
   height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$combined")
   duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$combined")
 
-  debug "Video: ${width}x${height}, duration=$duration"
-
-  # Crop math
+  # === CROP MATH ===
   crop_left_px=$(awk "BEGIN {print int($width * $left / 2)}")
   crop_right_px=$(awk "BEGIN {print int($width * $right / 2)}")
   crop_bottom_px=$(awk "BEGIN {print int($height * $bottom / 2)}")
@@ -230,35 +207,78 @@ EOF
   crop_w=$((width - crop_left_px - crop_right_px))
   crop_h=$((height - crop_top_px - crop_bottom_px))
 
-  debug "Crop px: left=$crop_left_px right=$crop_right_px top=$crop_top_px bottom=$crop_bottom_px w=$crop_w h=$crop_h"
+  # === FILTER SLOTS ===
+  slot_crop="crop=w=$crop_w:h=$crop_h:x=$crop_left_px:y=$crop_top_px"
+  slot_scale="$default_scale"
+  slot_denoise="$default_denoise"
+  slot_texture=""
+  slot_sharpen="$default_sharpen"
+  slot_color=""
+  slot_look=""
 
-  # Preview or final
-  if [[ "${do_preview,,}" == "true" ]]; then
-    log "Generating preview → $preview"
-    ffmpeg -y -ss "$start" -i "$combined" \
-      -vf "crop=w=$crop_w:h=$crop_h:x=$crop_left_px:y=$crop_top_px" \
-      -t "$preview_len" -c:v h264_videotoolbox -b:v 60000000 "$preview"
+  IFS=',' read -ra USER_FILTERS <<< "$additional_params"
+  for f in "${USER_FILTERS[@]}"; do
+    [[ -z "$f" ]] && continue
+    case "$f" in
+      crop=*)      slot_crop="$f" ;;
+      scale=*)     slot_scale="$f" ;;
+      hqdn3d=*|nlmeans=*|vaguedenoiser=*) slot_denoise="$f" ;;
+      unsharp=*|sharpen=*) slot_sharpen="$f" ;;
+      eq=*|curves=*|colorbalance=*|hue=*|gamma=*) slot_color="$f" ;;
+      lut=*|vignette=*|lenscorrection=*) slot_look="$f" ;;
+      smartblur=*|guided=*|bilateral=*|*) slot_texture="$slot_texture,$f" ;;
+    esac
+  done
+
+  slot_texture="${slot_texture#,}"
+
+  # === BUILD VF CHAIN ===
+  if [[ "$HEVC_DOWNSCALE" == true ]]; then
+    # H.265 path: downscale → force 8-bit → filter → upscale → force 8-bit
+    vf_chain="$slot_crop,scale=1920:1080,format=yuv420p,$slot_denoise"
+    [[ -n "$slot_texture" ]] && vf_chain="$vf_chain,$slot_texture"
+    [[ -n "$slot_sharpen" ]] && vf_chain="$vf_chain,$slot_sharpen"
+    [[ -n "$slot_color" ]] && vf_chain="$vf_chain,$slot_color"
+    [[ -n "$slot_look" ]] && vf_chain="$vf_chain,$slot_look"
+    vf_chain="$vf_chain,scale=in_range=tv:out_range=tv,scale=3840:2160:flags=lanczos,format=yuv420p"
   else
-    trim_duration=$(awk "BEGIN {print $duration - $start - $end}")
-    log "Generating final → $final (trim_duration=$trim_duration)"
-
-    if [[ "$no_crop" == true ]]; then
-      ffmpeg -y -ss "$start" -i "$combined" \
-        -t "$trim_duration" -c copy -movflags +faststart "$final"
-      rm -f "$combined"
-    else
-      ffmpeg -y -ss "$start" -i "$combined" \
-        -vf "crop=w=$crop_w:h=$crop_h:x=$crop_left_px:y=$crop_top_px,
-             scale=3840:2160:flags=lanczos,
-             unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.5,
-             hqdn3d=10" \
-        -t "$trim_duration" \
-        -c:v h264_videotoolbox -b:v 60000000 \
-        -movflags +faststart \
-        -c:a aac -b:a 384k -ar 48000 \
-        "$final"
-    fi
+    # H.264 path: full-res filter chain → force 8-bit
+    vf_chain="$slot_crop,$slot_scale,format=yuv420p,$slot_denoise"
+    [[ -n "$slot_texture" ]] && vf_chain="$vf_chain,$slot_texture"
+    [[ -n "$slot_sharpen" ]] && vf_chain="$vf_chain,$slot_sharpen"
+    [[ -n "$slot_color" ]] && vf_chain="$vf_chain,$slot_color"
+    [[ -n "$slot_look" ]] && vf_chain="$vf_chain,$slot_look"
+    vf_chain="$vf_chain,format=yuv420p"
   fi
+
+  # === PREVIEW (PR2) ===
+  if [[ "${do_preview,,}" == "true" ]]; then
+    log "Rendering preview (PR2, full filter chain)"
+    ffmpeg -y -ss "$start" -i "$combined" \
+      -vf "$vf_chain" \
+      -t "$preview_len" \
+      -c:v $ENCODER $ENC_OPTS \
+      "$preview"
+    cd - >/dev/null
+    return
+  fi
+
+  # === FINAL RENDER (F3) ===
+  if [[ -f "$final" ]]; then
+    read -r -p "Final file exists. Overwrite? (y/n) " ans
+    [[ "$ans" != "y" ]] && { cd - >/dev/null; return; }
+  fi
+
+  log "Rendering FINAL output"
+  trim_duration=$(awk "BEGIN {print $duration - $start - $end}")
+
+  ffmpeg -y -ss "$start" -i "$combined" \
+    -vf "$vf_chain" \
+    -t "$trim_duration" \
+    -c:v $ENCODER $ENC_OPTS \
+    -movflags +faststart \
+    -c:a aac -b:a 384k -ar 48000 \
+    "$final"
 
   cd - >/dev/null
 }
