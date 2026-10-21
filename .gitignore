@@ -1,0 +1,43 @@
+# Ignore temporary work directories
+work/
+tmp/
+temp/
+*.tmp
+
+# Ignore video files (examples, don't commit large files)
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.flv
+*.wmv
+*.webm
+*.m4v
+
+# Ignore audio files
+*.mp3
+*.aac
+*.wav
+*.flac
+
+# Ignore image files (thumbnails)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Ignore log files
+*.log
+
+# Ignore editor files
+.vscode/
+.idea/
+*.sublime-*

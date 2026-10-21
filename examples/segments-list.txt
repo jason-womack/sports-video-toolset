@@ -1,0 +1,11 @@
+# Example: List of video segments to combine
+# One file path per line
+# Lines starting with # are comments
+
+# First half segments
+/path/to/footage/game-q1.mp4
+/path/to/footage/game-q2.mp4
+
+# Second half segments
+/path/to/footage/game-q3.mp4
+/path/to/footage/game-q4.mp4

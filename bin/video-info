@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# video-info - Display detailed video file information
+# Usage: video-info FILE [FILE...]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+
+# shellcheck source=../lib/video-utils.sh
+source "$LIB_DIR/video-utils.sh"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") FILE [FILE...]
+
+Display detailed information about video file(s).
+
+Arguments:
+    FILE        Video file(s) to analyze
+
+Options:
+    -h, --help          Show this help message
+    -v, --verbose       Show detailed ffprobe output
+    -j, --json          Output in JSON format
+
+Examples:
+    $(basename "$0") game.mp4
+    $(basename "$0") video1.mp4 video2.mp4 video3.mp4
+    $(basename "$0") --verbose game.mp4
+    $(basename "$0") --json game.mp4
+
+Notes:
+    - Shows codec, resolution, duration, framerate, bitrate
+    - Multiple files can be analyzed in one command
+    - Verbose mode shows full ffprobe output
+EOF
+}
+
+show_detailed_info() {
+    local file="$1"
+    
+    if ! validate_input_file "$file"; then
+        return 1
+    fi
+    
+    echo "================================================"
+    echo "File: $file"
+    echo "================================================"
+    
+    # File size
+    local file_size
+    file_size=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo "0")
+    local size_readable
+    size_readable=$(numfmt --to=iec-i --suffix=B "$file_size" 2>/dev/null || echo "${file_size} bytes")
+    echo "Size:        $size_readable"
+    
+    # Duration
+    local duration
+    duration=$(get_duration "$file")
+    echo "Duration:    $duration seconds"
+    
+    # Video stream info
+    echo ""
+    echo "Video Stream:"
+    echo "  Codec:     $(get_video_codec "$file")"
+    echo "  Resolution: $(get_resolution "$file")"
+    echo "  Framerate:  $(get_framerate "$file")"
+    
+    # Video bitrate
+    local video_bitrate
+    video_bitrate=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=bit_rate \
+        -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null || echo "N/A")
+    if [[ "$video_bitrate" != "N/A" && "$video_bitrate" != "" ]]; then
+        local bitrate_mbps
+        bitrate_mbps=$(awk "BEGIN {printf \"%.2f\", $video_bitrate/1000000}")
+        echo "  Bitrate:    ${bitrate_mbps} Mbps"
+    fi
+    
+    # Audio stream info
+    echo ""
+    echo "Audio Stream:"
+    local audio_codec
+    audio_codec=$(get_audio_codec "$file")
+    if [[ -n "$audio_codec" ]]; then
+        echo "  Codec:     $audio_codec"
+        
+        # Audio sample rate
+        local sample_rate
+        sample_rate=$(ffprobe -v error -select_streams a:0 \
+            -show_entries stream=sample_rate \
+            -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null || echo "N/A")
+        if [[ "$sample_rate" != "N/A" ]]; then
+            echo "  Sample rate: $sample_rate Hz"
+        fi
+        
+        # Audio channels
+        local channels
+        channels=$(ffprobe -v error -select_streams a:0 \
+            -show_entries stream=channels \
+            -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null || echo "N/A")
+        if [[ "$channels" != "N/A" ]]; then
+            echo "  Channels:   $channels"
+        fi
+    else
+        echo "  No audio stream"
+    fi
+    
+    echo ""
+}
+
+show_json_info() {
+    local file="$1"
+    
+    if ! validate_input_file "$file"; then
+        return 1
+    fi
+    
+    ffprobe -v quiet -print_format json -show_format -show_streams "$file"
+}
+
+show_verbose_info() {
+    local file="$1"
+    
+    if ! validate_input_file "$file"; then
+        return 1
+    fi
+    
+    echo "================================================"
+    echo "File: $file"
+    echo "================================================"
+    ffprobe -hide_banner "$file"
+    echo ""
+}
+
+main() {
+    local files=()
+    local verbose=false
+    local json=false
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -v|--verbose)
+                verbose=true
+                shift
+                ;;
+            -j|--json)
+                json=true
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                files+=("$1")
+                shift
+                ;;
+        esac
+    done
+    
+    # Validate required arguments
+    if [[ ${#files[@]} -eq 0 ]]; then
+        log_error "Missing required argument: FILE"
+        usage
+        exit 1
+    fi
+    
+    # Check dependencies
+    check_ffmpeg || exit 1
+    check_ffprobe || exit 1
+    
+    # Process each file
+    for file in "${files[@]}"; do
+        if [[ "$json" == true ]]; then
+            show_json_info "$file"
+        elif [[ "$verbose" == true ]]; then
+            show_verbose_info "$file"
+        else
+            show_detailed_info "$file"
+        fi
+    done
+}
+
+main "$@"

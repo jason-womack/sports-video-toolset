@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# video-combine - Losslessly concatenate multiple video files
+# Usage: video-combine OUTPUT INPUT1 INPUT2 [INPUT3 ...]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+
+# shellcheck source=../lib/video-utils.sh
+source "$LIB_DIR/video-utils.sh"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") OUTPUT INPUT1 INPUT2 [INPUT3 ...]
+   or: $(basename "$0") OUTPUT --list FILELIST
+
+Losslessly concatenate multiple video files into a single file.
+
+Arguments:
+    OUTPUT              Output video file
+    INPUT1 INPUT2 ...   Input video files (in order)
+    --list FILELIST     Read input files from a text file (one per line)
+
+Options:
+    -h, --help          Show this help message
+    -f, --force         Overwrite output file if it exists
+    -s, --safe          Use demuxer concat (safer but requires compatible files)
+
+Examples:
+    $(basename "$0") game-full.mp4 quarter1.mp4 quarter2.mp4 quarter3.mp4 quarter4.mp4
+    $(basename "$0") game-full.mp4 --list segments.txt
+    $(basename "$0") --force game-full.mp4 part*.mp4
+
+Notes:
+    - All input files must have the same codecs, resolution, and framerate
+    - Uses concat demuxer for lossless concatenation
+    - Files are joined in the order specified
+    - For incompatible files, re-encode all to matching format first
+
+File list format (one file per line):
+    /path/to/video1.mp4
+    /path/to/video2.mp4
+    /path/to/video3.mp4
+EOF
+}
+
+main() {
+    local output=""
+    local inputs=()
+    local force=false
+    local use_list=false
+    local list_file=""
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -f|--force)
+                force=true
+                shift
+                ;;
+            -s|--safe)
+                log_warn "Safe mode is the default (and only) mode"
+                shift
+                ;;
+            --list)
+                use_list=true
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "Missing file list argument"
+                    exit 1
+                fi
+                list_file="$1"
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                if [[ -z "$output" ]]; then
+                    output="$1"
+                else
+                    inputs+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Validate required arguments
+    if [[ -z "$output" ]]; then
+        log_error "Missing required argument: OUTPUT"
+        usage
+        exit 1
+    fi
+    
+    # Load inputs from list file if specified
+    if [[ "$use_list" == true ]]; then
+        if [[ ! -f "$list_file" ]]; then
+            log_error "List file does not exist: $list_file"
+            exit 1
+        fi
+        
+        while IFS= read -r line; do
+            # Skip empty lines and comments
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+            inputs+=("$line")
+        done < "$list_file"
+    fi
+    
+    # Validate we have at least 2 input files
+    if [[ ${#inputs[@]} -lt 2 ]]; then
+        log_error "At least 2 input files are required"
+        usage
+        exit 1
+    fi
+    
+    # Check dependencies
+    check_ffmpeg || exit 1
+    check_ffprobe || exit 1
+    
+    # Validate all input files
+    for input in "${inputs[@]}"; do
+        validate_input_file "$input" || exit 1
+    done
+    
+    # Check if output file exists
+    if [[ -f "$output" ]] && [[ "$force" != true ]]; then
+        log_error "Output file already exists: $output"
+        log_info "Use -f or --force to overwrite"
+        exit 1
+    fi
+    
+    # Ensure output directory exists
+    ensure_output_dir "$output"
+    
+    # Create temporary concat file
+    local concat_file
+    concat_file=$(mktemp /tmp/video-combine.XXXXXX.txt)
+    trap 'rm -f "$concat_file"' EXIT
+    
+    log_info "Creating concat list..."
+    for input in "${inputs[@]}"; do
+        # Use absolute paths in concat file
+        local abs_path
+        abs_path=$(cd "$(dirname "$input")" && pwd)/$(basename "$input")
+        echo "file '$abs_path'" >> "$concat_file"
+        log_info "  - $input"
+    done
+    
+    # Build ffmpeg command
+    local ffmpeg_cmd=(
+        ffmpeg
+        -f concat
+        -safe 0
+        -i "$concat_file"
+        -c copy
+    )
+    
+    if [[ "$force" == true ]]; then
+        ffmpeg_cmd+=(-y)
+    fi
+    
+    ffmpeg_cmd+=("$output")
+    
+    # Execute combine operation
+    log_info "Combining ${#inputs[@]} video files..."
+    log_info "Output: $output"
+    
+    if "${ffmpeg_cmd[@]}"; then
+        verify_output "$output"
+    else
+        log_error "Failed to combine videos"
+        exit 1
+    fi
+}
+
+main "$@"

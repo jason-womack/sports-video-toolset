@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# video-prepare - Prepare video for publishing with metadata and thumbnails
+# Usage: video-prepare INPUT OUTPUT
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+
+# shellcheck source=../lib/video-utils.sh
+source "$LIB_DIR/video-utils.sh"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") INPUT OUTPUT [OPTIONS]
+
+Prepare video for publishing with metadata and optimization.
+
+Arguments:
+    INPUT       Input video file
+    OUTPUT      Output video file
+
+Options:
+    -h, --help              Show this help message
+    -i, --info              Show input file information only
+    -f, --force             Overwrite output file if it exists
+    -t, --title TITLE       Set video title metadata
+    -a, --author AUTHOR     Set author/artist metadata
+    -d, --date DATE         Set date metadata (YYYY-MM-DD)
+    -c, --comment TEXT      Set comment/description metadata
+    --thumbnail TIME        Extract thumbnail at specified time (HH:MM:SS)
+    --faststart             Enable fast start for web streaming
+    --strip-metadata        Remove all existing metadata
+
+Examples:
+    $(basename "$0") game.mp4 published.mp4 -t "Championship Game" -a "Sports Team"
+    $(basename "$0") game.mp4 web.mp4 --faststart --thumbnail 00:05:30
+    $(basename "$0") raw.mp4 clean.mp4 --strip-metadata
+
+Notes:
+    - Fast start optimizes MP4 for web streaming (moov atom at start)
+    - Thumbnail is saved as OUTPUT.jpg
+    - Uses stream copy for lossless metadata updates
+    - Metadata changes do not re-encode video
+EOF
+}
+
+extract_thumbnail() {
+    local input="$1"
+    local output="$2"
+    local time="$3"
+    
+    local thumbnail="${output%.*}.jpg"
+    
+    log_info "Extracting thumbnail at $time..."
+    
+    if ffmpeg -ss "$time" -i "$input" -vframes 1 -q:v 2 "$thumbnail" -y; then
+        log_success "Thumbnail saved: $thumbnail"
+    else
+        log_warn "Failed to extract thumbnail"
+    fi
+}
+
+main() {
+    local input=""
+    local output=""
+    local force=false
+    local info_only=false
+    local title=""
+    local author=""
+    local date=""
+    local comment=""
+    local thumbnail_time=""
+    local faststart=false
+    local strip_metadata=false
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -i|--info)
+                info_only=true
+                shift
+                ;;
+            -f|--force)
+                force=true
+                shift
+                ;;
+            -t|--title)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "Missing title argument"
+                    exit 1
+                fi
+                title="$1"
+                shift
+                ;;
+            -a|--author)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "Missing author argument"
+                    exit 1
+                fi
+                author="$1"
+                shift
+                ;;
+            -d|--date)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "Missing date argument"
+                    exit 1
+                fi
+                date="$1"
+                shift
+                ;;
+            -c|--comment)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "Missing comment argument"
+                    exit 1
+                fi
+                comment="$1"
+                shift
+                ;;
+            --thumbnail)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "Missing thumbnail time argument"
+                    exit 1
+                fi
+                thumbnail_time="$1"
+                shift
+                ;;
+            --faststart)
+                faststart=true
+                shift
+                ;;
+            --strip-metadata)
+                strip_metadata=true
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                if [[ -z "$input" ]]; then
+                    input="$1"
+                elif [[ -z "$output" ]]; then
+                    output="$1"
+                else
+                    log_error "Too many arguments"
+                    usage
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Validate required arguments
+    if [[ -z "$input" ]]; then
+        log_error "Missing required argument: INPUT"
+        usage
+        exit 1
+    fi
+    
+    # Check dependencies
+    check_ffmpeg || exit 1
+    check_ffprobe || exit 1
+    
+    # Validate input file
+    validate_input_file "$input" || exit 1
+    
+    # Show info and exit if requested
+    if [[ "$info_only" == true ]]; then
+        show_video_info "$input"
+        exit 0
+    fi
+    
+    # Validate remaining arguments
+    if [[ -z "$output" ]]; then
+        log_error "Missing required argument: OUTPUT"
+        usage
+        exit 1
+    fi
+    
+    # Check if output file exists
+    if [[ -f "$output" ]] && [[ "$force" != true ]]; then
+        log_error "Output file already exists: $output"
+        log_info "Use -f or --force to overwrite"
+        exit 1
+    fi
+    
+    # Ensure output directory exists
+    ensure_output_dir "$output"
+    
+    # Extract thumbnail if requested (before processing)
+    if [[ -n "$thumbnail_time" ]]; then
+        extract_thumbnail "$input" "$output" "$thumbnail_time"
+    fi
+    
+    # Build ffmpeg command
+    local ffmpeg_cmd=(
+        ffmpeg
+        -i "$input"
+    )
+    
+    # Add metadata
+    if [[ "$strip_metadata" == true ]]; then
+        ffmpeg_cmd+=(-map_metadata -1)
+    else
+        ffmpeg_cmd+=(-map_metadata 0)
+        
+        if [[ -n "$title" ]]; then
+            ffmpeg_cmd+=(-metadata "title=$title")
+        fi
+        
+        if [[ -n "$author" ]]; then
+            ffmpeg_cmd+=(-metadata "artist=$author")
+            ffmpeg_cmd+=(-metadata "author=$author")
+        fi
+        
+        if [[ -n "$date" ]]; then
+            ffmpeg_cmd+=(-metadata "date=$date")
+        fi
+        
+        if [[ -n "$comment" ]]; then
+            ffmpeg_cmd+=(-metadata "comment=$comment")
+        fi
+    fi
+    
+    # Use stream copy for lossless operation
+    ffmpeg_cmd+=(
+        -c copy
+    )
+    
+    # Add faststart if requested
+    if [[ "$faststart" == true ]]; then
+        ffmpeg_cmd+=(-movflags +faststart)
+    fi
+    
+    if [[ "$force" == true ]]; then
+        ffmpeg_cmd+=(-y)
+    fi
+    
+    ffmpeg_cmd+=("$output")
+    
+    # Execute prepare operation
+    log_info "Preparing video for publishing..."
+    log_info "Input:  $input"
+    log_info "Output: $output"
+    if [[ -n "$title" ]]; then
+        log_info "Title: $title"
+    fi
+    if [[ -n "$author" ]]; then
+        log_info "Author: $author"
+    fi
+    if [[ "$faststart" == true ]]; then
+        log_info "Fast start: enabled"
+    fi
+    if [[ "$strip_metadata" == true ]]; then
+        log_info "Metadata: stripped"
+    fi
+    
+    if "${ffmpeg_cmd[@]}"; then
+        verify_output "$output"
+    else
+        log_error "Failed to prepare video"
+        exit 1
+    fi
+}
+
+main "$@"
